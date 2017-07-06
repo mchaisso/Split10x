@@ -15,67 +15,9 @@
 #include <numeric>
 #include <iomanip>
 
-using namespace std;
-string ExtractBarcode(char *str) {
-	int len = strlen(str);
-	int i;
-	for (i = 0; i < len; i++) {
-		if (str[i] == '-' or str[i] == '_') {
-			return string(str,i);
-		}
-	}
-	return "";
-}
+#include "BarcodeTools.h"
 
-int CountUnique(map<string,int> &l1, map<string,int> &l2, int &u1, int &u2) {
-	map<string,int>::iterator lit;
-	u1 = 0;
-	u2 = 0;
-	for (lit = l1.begin(); lit != l1.end(); ++lit) {
-		if (l2.find(lit->first) == l2.end()) {
-			++u1;
-		}
-	}
-	for (lit = l2.begin(); lit != l2.end(); ++lit) {
-		if (l1.find(lit->first) == l1.end()) {
-			++u2;
-		}
-	}
-}
-		
-	
-void ParseBarcodeList(char* str, vector<string> &refBCList, vector<string> &altBCList) {
-	int s, e;
-	bool parseRef = true;
-	for (s = 0; str[s] != '\0'; s++) {
-		for (e = s; str[e] != '\0'; e++) {
-			if (str[e] == '-') {
-				if (e > s) {
-					if (parseRef == true) {
-						refBCList.push_back(string(&str[s], e-s));
-					}
-					else {
-						altBCList.push_back(string(&str[s],e-s));
-					}
-				}
-				break;
-			}
-		}
-		s = e;
-		for (; str[s] != '\0'; s++) {
-			if (str[s] == ',') {
-				parseRef = false;
-				break;
-			}
-			if (str[s] == ';') {
- 				break;
-			}
-		}
-		if (str[s] == '\0') {
-			return;
-		}
-	}
-}
+using namespace std;
 int RemoveInactiveBarcodes(map<string,int> & bc, int curDNAPos, int dist) {
 	map<string, int>::iterator bcIt;
 	bcIt = bc.begin();
@@ -99,11 +41,62 @@ int RemoveInactiveBarcodes(map<string,int> & bc, int curDNAPos, int dist) {
 	return minPos;
 }
 
+class PhaseQuery {
+public:
+	vector< pair<int, int> > intervals;
+	vector<int> phase;
+	int FindPhase(int pos) {
+		int i;
+		while (i < intervals.size()) {
+			if (intervals[i].first <= pos and pos < intervals[i].second) {
+				return phase[i];
+			}
+			else if (pos < intervals.size() - 1 and intervals[i].second <= pos and pos < intervals[i+1].first) {
+				// Return middle
+				int middle = (intervals[i].second + intervals[i+1].first)/2;
+				if (pos < middle) {
+					return phase[i];
+				}
+				else {
+					return phase[i+1];
+				}
+			}
+			i+=1;
+		}
+		return 3;
+	}
+
+};
+	
+void MakePhaseQuery(vector<int> &phase, vector<string> &chrom, vector<int> &pos, map<string, PhaseQuery> &chromQueries, int minBlockSize=20000) {
+	int i =0;
+	while (i < phase.size()) {
+		if (i < phase.size() - 1 and phase[i] != phase[i+1]) {
+			i+=1;
+			continue;
+		}
+		if (chromQueries.find(chrom[i]) == chromQueries.end()) {
+			chromQueries[chrom[i]] = PhaseQuery();
+		}
+		if ((pos[i+1] - pos[i]) > minBlockSize ) {
+			chromQueries[chrom[i]].intervals.push_back(pair<int,int>(pos[i], pos[i+1]));
+			chromQueries[chrom[i]].phase.push_back(phase[i]);
+			cerr << "switching " << chrom[i] << " " << pos[i] << " " << pos[i+1] << " " << phase[i] << endl;
+		}
+		i+=2;
+	}
+	chromQueries["chrX"] = PhaseQuery();
+	chromQueries["chrX"].intervals.push_back(pair<int,int>(0,100000000));
+	chromQueries["chrX"].phase.push_back(2);
+}
+
 int main(int argc, char* argv[]) {
 
 	if (argc < 5) {
-		cout << "Usage: split10x reads.bam phased-vcf base dist" << endl;
-		exit(1);
+		cout << "Usage: split10x reads.bam phased-vcf base dist [-v] [ --switch switchfile ]" << endl;
+		cout << "switchfile is a file of phase\tchrom\tpos, one line per endpoint, " << endl
+				 << "of all endpoints between switch errors." << endl;
+	  exit(1);
 	}
 			
 	string bamFileName = argv[1];
@@ -111,9 +104,22 @@ int main(int argc, char* argv[]) {
 	string hetBase     = argv[3];
 	int    dist        = atoi(argv[4]);
 	bool verbose = false;
-	if (argc > 5 and string(argv[5]) == "-v") {
-		verbose = true;
+	int argi = 5;
+	string switchFileName = "";
+	while (argi < argc) {
+		if (string(argv[argi]) == "-v") {
+			verbose = true;
+		}
+		else if (string(argv[argi]) == "--switch") {
+			switchFileName = argv[++argi];
+		}
+		else {
+			cout << "Invalid option " << argv[argi];
+			exit(1);
+		}
+		argi++;
 	}
+	
 	hts_itr_t *iter=NULL;
  	hts_idx_t *bamIndex=NULL;
 	samFile *readsFile = NULL;
@@ -133,7 +139,31 @@ int main(int argc, char* argv[]) {
 
 	string hap0Name = hetBase + ".0.bam";
 	string hap1Name = hetBase + ".1.bam";
-
+	vector<int> switchHap;
+	vector<string> switchChrom;
+	vector<int> switchPos;
+	map<string, PhaseQuery> phaseQuery;
+	bool checkPhase = false;
+	if (switchFileName != "") {
+		ifstream switchFile(switchFileName.c_str());
+		string line;
+		while (switchFile) {
+			getline(switchFile, line);
+			stringstream strm(line);
+			int hap, pos;
+			string chrom;
+			if (!(strm >> hap >> chrom >> pos)) {
+				break;
+			}
+			else {
+				switchHap.push_back(hap);
+				switchChrom.push_back(chrom);
+				switchPos.push_back(pos);
+			}
+		}
+		MakePhaseQuery(switchHap, switchChrom, switchPos, phaseQuery);
+		checkPhase = true;
+	}
 		
 	
 	readsFile = hts_open(bamFileName.c_str(), "r");
@@ -148,11 +178,13 @@ int main(int argc, char* argv[]) {
 	htsFile *hap0 = hts_open(hap0Name.c_str(), "wb");
 	htsFile *hap1 = hts_open(hap1Name.c_str(), "wb");
 
-	sam_hdr_write(hap0, header);
-	sam_hdr_write(hap1, header);
+	int res;
+	res=sam_hdr_write(hap0, header);
+	res=sam_hdr_write(hap1, header);
 	
 	read = bam_init1();	
 	int targetId;
+	
 	for (targetId = 0; targetId < header->n_targets; targetId++) {
 		map<string, int> activeH0Barcodes, activeH1Barcodes;
 		int curVarPos = 0;
@@ -172,6 +204,9 @@ int main(int argc, char* argv[]) {
 		int bamRetval;
 		int h0BCPos = 0;
 		int h1BCPos = 0;
+		int nUnassigned = 0;
+		int nAssigned = 0;
+		int nAuto = 0;
 		while ((bamRetval = bam_itr_next(readsFile, bamIter, read)) > 0) {
 			uint8_t *aux = bam_aux_get(read, "BX");
 			++nReads;
@@ -183,6 +218,8 @@ int main(int argc, char* argv[]) {
 			char *bcStr = bam_aux2Z(aux);
 			string readBarcode = ExtractBarcode(bcStr);
 			curDNAPos = read->core.pos;
+
+			
 			//
 			// First purge inactive elements.
 			//
@@ -195,6 +232,15 @@ int main(int argc, char* argv[]) {
 			//
 			// Advance the list of active elements
 			//
+			int phase = 0;
+			if (checkPhase) {
+
+				string chrom = string(header->target_name[read->core.tid]);
+				if (phaseQuery.find(chrom) != phaseQuery.end()) {
+					phase = phaseQuery[chrom].FindPhase(curDNAPos);
+				}
+			}
+			
 			while (curVarPos - curDNAPos < dist and
 						 tbx_itr_next(vcfFile, tabix, vcfIter, &str) >=0 ) {
 				int ndst = 0; char **dst = NULL;
@@ -219,40 +265,43 @@ int main(int argc, char* argv[]) {
 							int refAllele = 0;
 							int p0 = bcf_gt_is_phased(gt_arr[0]);
 							int p1 = bcf_gt_is_phased(gt_arr[1]);
+							int a0 = bcf_gt_allele(gt_arr[0]);
+							int a1 = bcf_gt_allele(gt_arr[1]);
+							//							cerr << p0 << " " << p1 << " " << a0 << " " << a1 << endl;
 							if (p0 or p1) {
-								int p0 = bcf_gt_allele(gt_arr[0]);
-								int p1 = bcf_gt_allele(gt_arr[1]);
 								string gt;
-								if (p0 == 0 and p1 == 1) {
-									gt= "0|1";
-								}
-								else if (p0== 1 and p1== 0) {
-									gt = "1|0";
-								}
-								else {
-									gt = "UNK";
-								}
-
-								if (p0 == 0) {
-									for (b = 0; b < refBCList.size(); b++) {
-										activeH0Barcodes[refBCList[b]] = var->pos;
+							
+								if (a0 != a1) {
+									if (a0 == 0 and a1 == 1) {
+										gt= "0|1";
 									}
-									for (b = 0; b < altBCList.size(); b++) {
-										activeH1Barcodes[altBCList[b]] = var->pos;
+									else if (a0== 1 and a1== 0) {
+										gt = "1|0";
 									}
-								}
-								else {
-									for (b = 0; b < altBCList.size(); b++) {
-										activeH0Barcodes[altBCList[b]] = var->pos;
+									else {
+										gt = "UNK";
 									}
-									for (b = 0; b < refBCList.size(); b++) {
-										activeH1Barcodes[refBCList[b]] = var->pos;
+									if (a0 == 0 ) {
+										for (b = 0; b < refBCList.size(); b++) {
+											activeH0Barcodes[refBCList[b]] = var->pos;
+										}
+										for (b = 0; b < altBCList.size(); b++) {
+											activeH1Barcodes[altBCList[b]] = var->pos;
+										}
 									}
-								}
-								if (verbose) {
-									int u1, u2;
-									CountUnique(activeH0Barcodes, activeH1Barcodes, u1,u2);
-									cerr << "# Unique " << u1 << "/" << activeH0Barcodes.size() << "\t" << u2 << "/" << activeH1Barcodes.size() << endl;
+									else {
+										for (b = 0; b < altBCList.size(); b++) {
+											activeH0Barcodes[altBCList[b]] = var->pos;
+										}
+										for (b = 0; b < refBCList.size(); b++) {
+											activeH1Barcodes[refBCList[b]] = var->pos;
+										}
+									}
+									if (verbose) {
+										int u1, u2;
+										CountUnique(activeH0Barcodes, activeH1Barcodes, u1,u2);
+										cerr << "# Unique " << u1 << "/" << activeH0Barcodes.size() << "\t" << u2 << "/" << activeH1Barcodes.size() << endl;
+									}
 								}
 							}
 						}
@@ -273,31 +322,89 @@ int main(int argc, char* argv[]) {
 				str = {0,0,0};
 
 			}
-			if (activeH0Barcodes.find(readBarcode) != activeH0Barcodes.end() and
-					activeH1Barcodes.find(readBarcode) != activeH1Barcodes.end()) {
+			if (activeH0Barcodes.find(readBarcode) == activeH0Barcodes.end() or
+					activeH1Barcodes.find(readBarcode) == activeH1Barcodes.end()) {
+				if (activeH0Barcodes.find(readBarcode) != activeH0Barcodes.end()) {
+					if (checkPhase) {
+						if (phase == 0) {
+							nAssigned++;
+							res=bam_write1(hap0->fp.bgzf, read);
+							nHap0++;
+						}
+						else if (phase == 1) {
+							nAssigned++;
+							res=bam_write1(hap1->fp.bgzf, read);
+							nHap1++;
+						}
+						else if (phase == 2) {
+							nAssigned++;
+							nAuto++;
+							res=bam_write1(hap0->fp.bgzf, read);
+							nHap0++;
+							res=bam_write1(hap1->fp.bgzf, read);
+							nHap1++;
+						}							
+						else {
+							nUnassigned++;
+						}
+					}
+					else {
+						res=bam_write1(hap0->fp.bgzf, read);
+						nAssigned++;
+						nHap0++;						
+					}
+				}
+				else if (activeH1Barcodes.find(readBarcode) != activeH1Barcodes.end()) {
+					if (checkPhase) {
+						if (phase == 0) {
+							nAssigned++;
+							res=bam_write1(hap1->fp.bgzf, read);
+							nHap1++;
+						}
+						else if (phase == 1) {
+							nAssigned++;
+							res=bam_write1(hap0->fp.bgzf, read);
+							nHap0++;
+						}
+						else if (phase == 2) {
+							nAssigned++;
+							nAuto++;
+							res=bam_write1(hap0->fp.bgzf, read);
+							nHap0++;
+							res=bam_write1(hap1->fp.bgzf, read);
+							nHap1++;
+						}							
+						
+						else {
+							nUnassigned++;
+						}
+					}
+					else {
+						res=bam_write1(hap1->fp.bgzf, read);
+						nAssigned++;
+						nHap1++;						
+					}
 
-			}
-			else if (activeH0Barcodes.find(readBarcode) != activeH0Barcodes.end()) {
-				bam_write1(hap0->fp.bgzf, read);
-				nHap0++;
-			}
-			else if (activeH1Barcodes.find(readBarcode) != activeH1Barcodes.end()) {
-				bam_write1(hap1->fp.bgzf, read);
-				nHap1++;
-			}
-			else {
-				++nUnphased;
+				}
+				else {
+					++nUnphased;
+				}
 			}
 			if (nReads % 1000000 == 0) {
-				cerr << "Processed " << nReads << endl;
+				cerr << header->target_name[targetId] << "\t" << curDNAPos << "\t" << nReads << "\t"
+						 << nAssigned << "\t" << nHap0 << "\t" << nHap1 << "\t" << nAuto << "\t"
+						 << activeH0Barcodes.size() << "\t" << activeH1Barcodes.size() << endl;
 			}
 		}
-		cerr << "Processed " << header->target_name[targetId] << " " << nReads << "\t" << nUnphased << endl;
+		cerr << "Processed " << header->target_name[targetId] << " " << nReads << "\t" << nUnphased << "\t" << nAssigned << "\t" << nUnassigned << endl;
 	}
 
 	bam_destroy1(read);
 	bam_hdr_destroy(header);
 	sam_close(readsFile);
+	sam_close(hap0);
+	sam_close(hap1);
+		
 
 	
 }
